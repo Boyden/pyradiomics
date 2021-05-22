@@ -448,12 +448,15 @@ def resampleImage(imageNode, maskNode, **kwargs):
 
   if imageNode is None or maskNode is None:
     raise ValueError('Requires both image and mask to resample')
-
+  
+  # image spacing
   maskSpacing = numpy.array(maskNode.GetSpacing())
   imageSpacing = numpy.array(imageNode.GetSpacing())
 
   Nd_resampled = len(resampledPixelSpacing)
+  # image dimensions, 3
   Nd_mask = len(maskSpacing)
+  # mask dimensions, 3
   assert Nd_resampled == Nd_mask, \
       'Wrong dimensionality (%i-D) of resampledPixelSpacing!, %i-D required' % (Nd_resampled, Nd_mask)
 
