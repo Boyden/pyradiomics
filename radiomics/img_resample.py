@@ -10,6 +10,115 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+def loadImage(ImageFilePath, MaskFilePath, generalInfo=None, **kwargs):
+    """
+    Load and pre-process the image and labelmap.
+    If ImageFilePath is a string, it is loaded as SimpleITK Image and assigned to ``image``,
+    if it already is a SimpleITK Image, it is just assigned to ``image``.
+    All other cases are ignored (nothing calculated).
+    Equal approach is used for assignment of ``mask`` using MaskFilePath. If necessary, a segmentation object (i.e. mask
+    volume with vector-image type) is then converted to a labelmap (=scalar image type). Data type is forced to UInt32.
+    See also :py:func:`~imageoperations.getMask()`.
+
+    If normalizing is enabled image is first normalized before any resampling is applied.
+
+    If resampling is enabled, both image and mask are resampled and cropped to the tumor mask (with additional
+    padding as specified in padDistance) after assignment of image and mask.
+
+    :param ImageFilePath: SimpleITK.Image object or string pointing to SimpleITK readable file representing the image
+                        to use.
+    :param MaskFilePath: SimpleITK.Image object or string pointing to SimpleITK readable file representing the mask
+                       to use.
+    :param generalInfo: GeneralInfo Object. If provided, it is used to store diagnostic information of the
+                      pre-processing.
+    :param kwargs: Dictionary containing the settings to use for this particular image type.
+    :return: 2 SimpleITK.Image objects representing the loaded image and mask, respectively.
+    """
+    global logger
+
+    normalize = kwargs.get('normalize', False)
+    interpolator = kwargs.get('interpolator')
+    resampledPixelSpacing = kwargs.get('resampledPixelSpacing')
+    preCrop = kwargs.get('preCrop', False)
+    label = kwargs.get('label', 1)
+
+    logger.info('Loading image and mask')
+    if isinstance(ImageFilePath, six.string_types) and os.path.isfile(ImageFilePath):
+        image = sitk.ReadImage(ImageFilePath)
+    elif isinstance(ImageFilePath, sitk.SimpleITK.Image):
+        image = ImageFilePath
+    else:
+        raise ValueError('Error reading image Filepath or SimpleITK object')
+
+    if isinstance(MaskFilePath, six.string_types) and os.path.isfile(MaskFilePath):
+        mask = sitk.ReadImage(MaskFilePath)
+    elif isinstance(MaskFilePath, sitk.SimpleITK.Image):
+        mask = MaskFilePath
+    else:
+        raise ValueError('Error reading mask Filepath or SimpleITK object')
+
+    # process the mask
+    mask = getMask(mask, **kwargs)
+
+    if generalInfo is not None:
+        generalInfo.addImageElements(image)
+        # Do not include the image here, as the overlap between image and mask have not been checked
+        # It is therefore possible that image and mask do not align, or even have different sizes.
+        generalInfo.addMaskElements(None, mask, label)
+
+    # This point is only reached if image and mask loaded correctly
+    if normalize:
+        image = normalizeImage(image, **kwargs)
+
+    if interpolator is not None and resampledPixelSpacing is not None:
+        image, mask = resampleImage(image, mask, **kwargs)
+        if generalInfo is not None:
+            generalInfo.addImageElements(image, 'interpolated')
+            generalInfo.addMaskElements(image, mask, label, 'interpolated')
+
+    return image, mask
+
+def getMask(mask, **kwargs):
+    """
+    Function to get the correct mask. Includes enforcing a correct pixel data type (UInt32).
+
+    Also supports extracting the mask for a segmentation (stored as SimpleITK Vector image) if necessary.
+    In this case, the mask at index ``label_channel`` is extracted. The resulting 3D volume is then treated as it were a
+    scalar input volume (i.e. with the region of interest defined by voxels with value matching ``label``).
+
+    Finally, checks if the mask volume contains an ROI identified by ``label``. Raises a value error if the label is not
+    present (including a list of valid labels found).
+
+    :param mask: SimpleITK Image object representing the mask. Can be a vector image to allow for overlapping masks.
+    :param kwargs: keyword arguments. If argument ``label_channel`` is present, this is used to select the channel.
+      Otherwise label_channel ``0`` is assumed.
+    :return: SimpleITK.Image with pixel type UInt32 representing the mask volume
+    """
+    global logger
+    label = kwargs.get('label', 1)
+    label_channel = kwargs.get('label_channel', 0)
+    if 'vector' in mask.GetPixelIDTypeAsString().lower():
+        logger.debug('Mask appears to be a segmentation object (=stored as vector image).')
+        n_components = mask.GetNumberOfComponentsPerPixel()
+        assert label_channel < n_components, \
+                "Mask %i requested, but segmentation object only contains %i objects" % (label_channel, n_components)
+
+        logger.info('Extracting mask at index %i', label_channel)
+        selector = sitk.VectorIndexSelectionCastImageFilter()
+        selector.SetIndex(label_channel)
+        mask = selector.Execute(mask)
+
+    logger.debug('Force casting mask to UInt32 to ensure correct datatype.')
+    mask = sitk.Cast(mask, sitk.sitkUInt32)
+
+    labels = np.unique(sitk.GetArrayFromImage(mask))
+    if len(labels) == 1 and labels[0] == 0:
+        raise ValueError('No labels found in this mask (i.e. nothing is segmented)!')
+    if label not in labels:
+        raise ValueError('Label (%g) not present in mask. Choose from %s' % (label, labels[labels != 0]))
+
+    return mask
+
 def cropToTumorMask(imageNode, maskNode, boundingBox, **kwargs):
     """
     Create a sitkImage of the segmented region of the image based on the input label.
@@ -77,9 +186,9 @@ def _checkROI(imageNode, maskNode, **kwargs):
     # LBound and size of the bounding box, as (L_X, L_Y, [L_Z], S_X, S_Y, [S_Z])
     # bb = np.array(lssif.GetBoundingBox(label))
     bb = np.array((0, 0, 0) + maskNode.GetSize())
-    print(f'Bounding Box:{bb}')
+    # print(f'Bounding Box:{bb}')
     Nd = maskNode.GetDimension()
-    print(f'Mask Dimension:{Nd}')
+    # print(f'Mask Dimension:{Nd}')
 
     # Determine if the ROI is within the physical space of the image
 
@@ -89,11 +198,11 @@ def _checkROI(imageNode, maskNode, **kwargs):
     # Upper bound index of ROI = bb[:Nd] + bb[Nd:] - 1 (LBound + Size - 1), .5 is added to get corner
     ROIBounds = (maskNode.TransformContinuousIndexToPhysicalPoint(bb[:Nd] - .5),    # Origin
                              maskNode.TransformContinuousIndexToPhysicalPoint(bb[:Nd] + bb[Nd:] - 0.5))    # UBound
-    print(f'Physical Space:{ROIBounds}')
+    # print(f'Physical Space:{ROIBounds}')
     # Step 2: Translate the ROI physical bounds to the image coordinate space
     ROIBounds = (imageNode.TransformPhysicalPointToContinuousIndex(ROIBounds[0]),    # Origin
                              imageNode.TransformPhysicalPointToContinuousIndex(ROIBounds[1]))
-    print(f'Voxel Space:{ROIBounds}')
+    # print(f'Voxel Space:{ROIBounds}')
     # logger.debug('ROI bounds (image coordinate space): %s', ROIBounds)
 
     # Check if any of the ROI bounds are outside the image indices (i.e. -0.5 < ROI < Im.Size -0.5)
@@ -197,12 +306,14 @@ def resampleImage(imageNode, maskNode, **kwargs):
         # re-calculate the bounding box of the mask
         lssif = sitk.LabelShapeStatisticsImageFilter()
         lssif.Execute(maskNode)
-        bb = np.array(lssif.GetBoundingBox(label))
+        # bb = np.array(lssif.GetBoundingBox(label))
+        # bb = np.array((0, 0, 0) + maskNode.GetSize())
 
         low_up_bb = np.empty(Nd_mask * 2, dtype=int)
         low_up_bb[::2] = bb[:Nd_mask]
         low_up_bb[1::2] = bb[:Nd_mask] + bb[Nd_mask:] - 1
-        return cropToTumorMask(imageNode, maskNode, low_up_bb, **kwargs)
+        # return cropToTumorMask(imageNode, maskNode, low_up_bb, **kwargs)
+        return imageNode, maskNode
 
     spacingRatio = maskSpacing / resampledPixelSpacing
 
